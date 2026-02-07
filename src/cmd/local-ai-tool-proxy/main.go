@@ -1,0 +1,108 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/tobilg/local-ai-tool-proxy/src/internal/config"
+	"github.com/tobilg/local-ai-tool-proxy/src/internal/handler"
+	"github.com/tobilg/local-ai-tool-proxy/src/internal/provider"
+)
+
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildDate = "unknown"
+)
+
+func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Printf("local-ai-tool-proxy %s (commit: %s, built: %s)\n", Version, Commit, BuildDate)
+		os.Exit(0)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
+
+	// Initialize all providers
+	providers := map[string]provider.Generator{
+		"claude":   provider.NewClaudeClient(),
+		"gemini":   provider.NewGeminiClient(),
+		"codex":    provider.NewCodexClient(),
+		"continue": provider.NewContinueClient(),
+		"opencode": provider.NewOpenCodeClient(),
+	}
+
+	// Validate configured provider exists
+	if _, ok := providers[cfg.Provider]; !ok {
+		log.Fatalf("Unknown provider: %s (valid options: claude, gemini, codex, continue, opencode)", cfg.Provider)
+	}
+
+	h := handler.New(providers, cfg.Provider, cfg.AllowedOrigin, cfg.SystemPrompt)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/prompt", h.HandlePrompt)
+	mux.HandleFunc("/providers", h.HandleProviders)
+	mux.HandleFunc("/health", h.HandleHealth)
+	mux.HandleFunc("/openapi.json", h.HandleOpenAPI)
+
+	server := &http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.Port),
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// Channel to listen for shutdown signals
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		protocol := "http"
+		if cfg.TLSEnabled() {
+			protocol = "https"
+		}
+
+		fmt.Printf("Local AI Tool Proxy active at %s://localhost:%d\n", protocol, cfg.Port)
+		fmt.Printf("Default provider: %s\n", cfg.Provider)
+		fmt.Printf("System prompt: %s\n", cfg.SystemPromptPath)
+		fmt.Printf("Allowed origin: %s\n", cfg.AllowedOrigin)
+		if cfg.TLSEnabled() {
+			fmt.Printf("TLS enabled: cert=%s, key=%s\n", cfg.TLSCert, cfg.TLSKey)
+		}
+		fmt.Println("Available providers: claude, gemini, codex, continue, opencode")
+		fmt.Printf("API docs: %s://localhost:%d/openapi.json\n", protocol, cfg.Port)
+		fmt.Println("Press Ctrl+C to stop")
+
+		var err error
+		if cfg.TLSEnabled() {
+			err = server.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+		} else {
+			err = server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	<-done
+	fmt.Println("\nShutting down...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server shutdown failed: %v", err)
+	}
+
+	fmt.Println("Server stopped")
+}

@@ -1,0 +1,218 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Run tests
+        run: make test
+
+  build:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          BINARY_NAME=local-ai-tool-proxy
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          go build -ldflags "-X main.Version=${{ steps.version.outputs.VERSION }} -X main.Commit=${{ github.sha }} -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o dist/${BINARY_NAME} ./src/cmd/local-ai-tool-proxy
+
+      - name: Create archive
+        run: |
+          cd dist
+          BINARY_NAME=local-ai-tool-proxy
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          ARCHIVE_NAME="local-ai-tool-proxy-${{ matrix.suffix }}"
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar -czvf "${ARCHIVE_NAME}.tar.gz" ${BINARY_NAME}
+          else
+            zip "${ARCHIVE_NAME}.zip" ${BINARY_NAME}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-ai-tool-proxy-${{ matrix.suffix }}
+          path: dist/local-ai-tool-proxy-${{ matrix.suffix }}.${{ matrix.archive }}
+          retention-days: 1
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*
+
+  # homebrew:
+  #   name: Update Homebrew Formula
+  #   runs-on: ubuntu-latest
+  #   needs: release
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #   steps:
+  #     - name: Extract version
+  #       id: version
+  #       run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+  #     - name: Wait for release assets
+  #       run: sleep 30
+
+  #     - name: Download release asset
+  #       run: |
+  #         curl -sL -o local-ai-tool-proxy.tar.gz \
+  #           "https://github.com/tobilg/ai-cli-proxy/releases/download/v${{ steps.version.outputs.version }}/local-ai-tool-proxy-darwin-arm64.tar.gz"
+
+  #     - name: Calculate SHA256
+  #       id: sha
+  #       run: echo "sha256=$(shasum -a 256 local-ai-tool-proxy.tar.gz | cut -d ' ' -f 1)" >> $GITHUB_OUTPUT
+
+  #     - name: Checkout tap repo
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: tobilg/homebrew-local-ai-tool-proxy
+  #         token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+  #         path: tap
+
+  #     - name: Update formula
+  #       run: |
+  #         cat > tap/Formula/local-ai-tool-proxy.rb << 'FORMULA_EOF'
+  #         class LocalAiToolProxy < Formula
+  #           desc "Local HTTP proxy bridging web apps with AI CLI tools"
+  #           homepage "https://github.com/tobilg/ai-cli-proxy"
+  #           version "${{ steps.version.outputs.version }}"
+  #           license "MIT"
+
+  #           on_macos do
+  #             on_arm do
+  #               url "https://github.com/tobilg/ai-cli-proxy/releases/download/v${{ steps.version.outputs.version }}/local-ai-tool-proxy-darwin-arm64.tar.gz"
+  #               sha256 "${{ steps.sha.outputs.sha256 }}"
+  #             end
+  #           end
+
+  #           def install
+  #             bin.install "local-ai-tool-proxy"
+  #             (var/"log").mkpath
+  #           end
+
+  #           service do
+  #             run [opt_bin/"local-ai-tool-proxy"]
+  #             keep_alive true
+  #             log_path var/"log/local-ai-tool-proxy.log"
+  #             error_log_path var/"log/local-ai-tool-proxy.log"
+  #             environment_variables LOCAL_AI_TOOL_PROXY_PORT: "4000", LOCAL_AI_TOOL_PROXY_PROVIDER: "claude", LOCAL_AI_TOOL_PROXY_ALLOWED_ORIGIN: "http://localhost:3000"
+  #           end
+
+  #           def caveats
+  #             <<~EOS
+  #               local-ai-tool-proxy runs an HTTP server that bridges web apps with AI CLI tools.
+
+  #               Configure via environment variables:
+  #                 LOCAL_AI_TOOL_PROXY_PORT=4000              # Server port (default: 4000)
+  #                 LOCAL_AI_TOOL_PROXY_PROVIDER=claude        # AI provider: claude, gemini, codex, continue, opencode
+  #                 LOCAL_AI_TOOL_PROXY_SYSTEM_PROMPT=/path/to/prompt.txt  # Required: system prompt file
+  #                 LOCAL_AI_TOOL_PROXY_ALLOWED_ORIGIN=http://localhost:3000  # CORS origin
+  #                 LOCAL_AI_TOOL_PROXY_TLS_CERT=/path/to/cert.pem   # Optional: TLS certificate
+  #                 LOCAL_AI_TOOL_PROXY_TLS_KEY=/path/to/key.pem     # Optional: TLS private key
+
+  #               To start as a background service:
+  #                 brew services start local-ai-tool-proxy
+
+  #               To stop the service:
+  #                 brew services stop local-ai-tool-proxy
+
+  #               To restart the service:
+  #                 brew services restart local-ai-tool-proxy
+
+  #               Or run manually:
+  #                 local-ai-tool-proxy
+
+  #               Logs are written to:
+  #                 #{var}/log/local-ai-tool-proxy.log
+
+  #               For HTTPS with self-signed certificates, use mkcert:
+  #                 brew install mkcert
+  #                 mkcert -install
+  #                 mkcert localhost 127.0.0.1 ::1
+  #                 LOCAL_AI_TOOL_PROXY_TLS_CERT=localhost+2.pem LOCAL_AI_TOOL_PROXY_TLS_KEY=localhost+2-key.pem local-ai-tool-proxy
+  #             EOS
+  #           end
+
+  #           test do
+  #             assert_match "local-ai-tool-proxy", shell_output("#{bin}/local-ai-tool-proxy --version")
+  #           end
+  #         end
+  #         FORMULA_EOF
+
+  #     - name: Commit and push
+  #       run: |
+  #         cd tap
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "github-actions[bot]@users.noreply.github.com"
+  #         git add Formula/local-ai-tool-proxy.rb
+  #         git diff --staged --quiet || git commit -m "Update local-ai-tool-proxy to v${{ steps.version.outputs.version }}"
+  #         git push
